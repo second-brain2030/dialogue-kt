@@ -1,0 +1,13 @@
+cluster,dominant_kc,condition,mean_trials_to_mastery,mastery_rate,leakage_rate
+0,評鑑,No-Zhu + Adaptive Minimal,4.01,96.5,3.0
+0,評鑑,No-Zhu + Heavy (Bottom-Out),2.12,99.5,1.0
+0,評鑑,Zhu-Aware + Heavy (Direct),2.17,100.0,3.5
+0,評鑑,Zhu-Aware + Adaptive Minimal (OURS),2.76,99.5,1.5
+1,重整,No-Zhu + Adaptive Minimal,2.6,88.0,10.5
+1,重整,No-Zhu + Heavy (Bottom-Out),1.94,94.5,9.0
+1,重整,Zhu-Aware + Heavy (Direct),1.83,98.5,12.0
+1,重整,Zhu-Aware + Adaptive Minimal (OURS),1.6,100.0,10.5
+2,評鑑,No-Zhu + Adaptive Minimal,4.01,96.5,3.0
+2,評鑑,No-Zhu + Heavy (Bottom-Out),2.12,99.5,1.0
+2,評鑑,Zhu-Aware + Heavy (Direct),2.17,100.0,3.5
+2,評鑑,Zhu-Aware + Adaptive Minimal (OURS),2.76,99.5,1.5

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Track B — BKT / DKT-multi-KC / DKT-SEM runner on the AiQGen/HKEAA dataset.
-Outputs: results/aiqgen_comparison.csv, guess_slip_by_zhu.csv, bkt_params.json.
+Track B — BKT / DKT-multi-KC / DKT-SEM / BKT+Qwen runner on the AiQGen/HKEAA dataset.
+Outputs: results/aiqgen_comparison.csv, hybrid_comparison.csv, guess_slip_by_zhu.csv, bkt_params.json
 BKT via pyBKT; DKT-multi/SEM via local PyTorch. Does NOT import training.py.
 """
 import json
@@ -24,31 +24,28 @@ from dialogue_kt.utils import device
 
 _REPO = Path(__file__).parent.parent
 
-# ── data loading ────────────────────────────────────────────────────────────
+def _load_splits(csv, kc_json):
+    """70/15/15 split; return (fit_df, test_df, kc_dict)."""
+    df = pd.read_csv(csv, converters={c: literal_eval for c in ["dialogue","meta_data","annotation"]}).sample(frac=1, random_state=221)
+    n = len(df); fit = pd.concat([df[:int(.7*n)], df[int(.7*n):int(.85*n)]]).reset_index(drop=True)
+    with open(kc_json) as f: kc_dict = json.load(f)
+    return fit, df[int(.85*n):], kc_dict
 
 def load_aiqgen_splits():
-    """Return (train_df, val_df, test_df) from the annotated CSV."""
-    csv = _REPO / "data/annotated/aiqgen_aiqgen.csv"
-    df = pd.read_csv(csv, converters={col: literal_eval for col in ["dialogue", "meta_data", "annotation"]}).sample(frac=1, random_state=221)
-    n = len(df)
-    return df[:int(.7 * n)], df[int(.7 * n):int(.85 * n)], df[int(.85 * n):]
-
+    fit, test, _ = _load_splits(_REPO/"data/annotated/aiqgen_aiqgen.csv",
+                                _REPO/"data/annotated/kc_dict_aiqgen_aiqgen.json")
+    return fit, test
 
 def load_kc_dict():
-    with open(_REPO / "data/annotated/kc_dict_aiqgen_aiqgen.json") as f:
-        return json.load(f)
+    with open(_REPO / "data/annotated/kc_dict_aiqgen_aiqgen.json") as f: return json.load(f)
 
-
-# ── BKT ─────────────────────────────────────────────────────────────────────
 
 def _dataset_to_bkt_df(dataset: DKTDataset) -> pd.DataFrame:
-    """Convert DKTDataset to pyBKT long format."""
     rows, order_id = [], 0
-    for sample in dataset.data:
-        for kc, label in zip(sample["kc_ids_flat"], sample["labels_flat"]):
-            rows.append({"user_id": sample["dialogue_idx"],
-                         "skill_name": str(kc), "correct": label, "order_id": order_id})
-            order_id += 1
+    for s in dataset.data:
+        for kc, label in zip(s["kc_ids_flat"], s["labels_flat"]):
+            rows.append({"user_id": s["dialogue_idx"], "skill_name": str(kc),
+                         "correct": label, "order_id": order_id}); order_id += 1
     return pd.DataFrame(rows)
 
 
@@ -66,18 +63,15 @@ def run_bkt(train_df, test_df, kc_dict):
     eval_df = model.evaluate(data=bkt_test, metric=["accuracy", "auc"])
     acc = float(eval_df["accuracy"].mean() if isinstance(eval_df, pd.DataFrame) else eval_df[0])
     auc = float(eval_df["auc"].mean()      if isinstance(eval_df, pd.DataFrame) else eval_df[1])
-
-    # Extract per-skill params — pyBKT skill index → KC name via kc_dict order
-    params_df = model.params().reset_index()
-    kc_names = list(kc_dict.keys())
-    params_dict = {}
-    for skill in params_df["skill"].unique():
-        sk = params_df[params_df["skill"] == skill]
-        get = lambda p: float(v.iloc[0]) if len(v := sk[sk["param"] == p]["value"]) else None
-        params_dict[kc_names[int(skill)]] = {
-            "prior": get("prior"), "learns": get("learns"),
-            "guesses": get("guesses"), "slips": get("slips"),
-        }
+    params_df  = model.params().reset_index()
+    kc_names   = list(kc_dict.keys())
+    params_dict = {kc_names[int(skill)]: {
+        "prior": float(v.iloc[0]) if len(v := sk[sk["param"]=="prior"]["value"]) else None,
+        "learns": float(v.iloc[0]) if len(v := sk[sk["param"]=="learns"]["value"]) else None,
+        "guesses": float(v.iloc[0]) if len(v := sk[sk["param"]=="guesses"]["value"]) else None,
+        "slips": float(v.iloc[0]) if len(v := sk[sk["param"]=="slips"]["value"]) else None,
+    } for skill in params_df["skill"].unique()
+      for sk in [params_df[params_df["skill"] == skill]]}
     return {
         "model": "BKT", "auc": round(auc, 4), "accuracy": round(acc, 4),
         "n_train": len(bkt_train), "n_test": len(bkt_test),
@@ -88,49 +82,37 @@ def run_bkt(train_df, test_df, kc_dict):
 # ── DKT helpers ─────────────────────────────────────────────────────────────
 
 def _eval_dkt(model, loader, kc_dict):
-    """Single eval pass; returns (accuracy, auc) or (None, None) if no data."""
+    """Single eval pass; returns (auc, accuracy) or (None, acc) if one class."""
     model.eval()
     all_labels, all_preds = [], []
     with torch.no_grad():
         for batch in loader:
-            labels = batch["labels"][:, 1:]           # shift: predict next turn
-            kc_ids = batch["kc_ids"]                  # B x L x K
-            num_kcs = batch["num_kcs"]
-            if labels.numel() == 0:
-                continue
-            y = model(batch)                          # B x L x num_kcs
-            # Gather KC probs for next turn, average across KCs
-            corr_probs = torch.gather(y[:, :-1], 2,
-                kc_ids[:, 1:]).sum(2) / num_kcs[:, 1:]
+            labels = batch["labels"][:, 1:]
+            if labels.numel() == 0: continue
+            y = model(batch)[:, :-1]
+            probs = torch.gather(y, 2, batch["kc_ids"][:, 1:]).sum(2) / batch["num_kcs"][:, 1:]
             mask = labels != -100
             all_labels.extend(labels[mask].tolist())
-            all_preds.extend(corr_probs[mask].tolist())
-    if len(set(all_labels)) < 2:      # need both classes for AUC
-        return None, accuracy_score(all_labels, [round(p) for p in all_preds])
-    return (roc_auc_score(all_labels, all_preds),
-            accuracy_score(all_labels, [round(p) for p in all_preds]))
+            all_preds.extend(probs[mask].tolist())
+    acc = accuracy_score(all_labels, [round(p) for p in all_preds])
+    if len(set(all_labels)) < 2: return None, acc
+    return roc_auc_score(all_labels, all_preds), acc
 
 
 def _train_dkt(model, train_loader, epochs=40, lr=1e-3):
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn = torch.nn.BCELoss()
+    opt = torch.optim.Adam(model.parameters(), lr=lr); loss_fn = torch.nn.BCELoss()
     for _ in range(epochs):
         model.train()
         for batch in train_loader:
             labels = batch["labels"][:, 1:].float()
-            y = model(batch)[:, :-1]
-            kc_ids = batch["kc_ids"][:, 1:]
-            num_kcs = batch["num_kcs"][:, 1:]
-            preds = torch.gather(y, 2, kc_ids).sum(2) / num_kcs
-            mask = batch["labels"][:, 1:] != -100
-            if mask.sum() == 0:
-                continue
+            preds  = torch.gather(model(batch)[:, :-1], 2, batch["kc_ids"][:, 1:]).sum(2) / batch["num_kcs"][:, 1:]
+            mask   = batch["labels"][:, 1:] != -100
+            if mask.sum() == 0: continue
             loss = loss_fn(preds[mask], labels[mask])
             opt.zero_grad(); loss.backward(); opt.step()
 
 
 def run_dkt_multi(train_df, test_df, kc_dict):
-    """Train DKT-multi-KC and return metrics dict."""
     t0 = time.time()
     collator = DKTCollator(flatten_kcs=False)
     train_ds = DKTDataset(train_df, kc_dict, None, None)
@@ -145,7 +127,6 @@ def run_dkt_multi(train_df, test_df, kc_dict):
 
 
 def run_dkt_sem(train_df, test_df, kc_dict):
-    """Train DKT-SEM with multilingual SBERT KC embeddings and return metrics dict."""
     from sentence_transformers import SentenceTransformer
     t0 = time.time()
     sbert = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
@@ -163,14 +144,24 @@ def run_dkt_sem(train_df, test_df, kc_dict):
             "elapsed_s": round(time.time() - t0, 1)}
 
 
+# ── BKT Hybrid (MVP 5) ──────────────────────────────────────────────────────
+
+def run_bkt_hybrid():
+    """Fit BKT on hybrid CSV (Qwen demonstrated_level as KC tag). Return metrics dict."""
+    fit_df, test_df, kc_dict = _load_splits(
+        _REPO / "data/annotated/aiqgen_hybrid.csv",
+        _REPO / "data/annotated/kc_dict_aiqgen_hybrid.json")
+    metrics, _ = run_bkt(fit_df, test_df, kc_dict)
+    metrics["model"] = "BKT+Qwen"
+    return metrics
+
+
 # ── main ────────────────────────────────────────────────────────────────────
 
 def main():
     os.makedirs(_REPO / "results", exist_ok=True)
     kc_dict = load_kc_dict()
-    train_df, val_df, test_df = load_aiqgen_splits()
-    # Use train+val for fitting (small dataset), hold test out
-    fit_df = pd.concat([train_df, val_df]).reset_index(drop=True)
+    fit_df, test_df = load_aiqgen_splits()
     print(f"Data split: fit={len(fit_df)}, test={len(test_df)} sequences\n")
 
     results = []
@@ -179,7 +170,6 @@ def main():
     results.append(bkt_metrics); print(bkt_metrics)
     with open(_REPO / "results/bkt_params.json", "w") as fp:
         json.dump(bkt_params, fp, indent=2, ensure_ascii=False)
-    print("  Saved bkt_params.json")
 
     print("── DKT-multi-KC ─────────────────────────")
     dkt_metrics = run_dkt_multi(fit_df, test_df, kc_dict)
@@ -189,8 +179,18 @@ def main():
     sem_metrics = run_dkt_sem(fit_df, test_df, kc_dict)
     results.append(sem_metrics); print(sem_metrics)
 
+    print("── BKT + Qwen hybrid ────────────────────")
+    hybrid_metrics = run_bkt_hybrid()
+    results.append(hybrid_metrics); print(hybrid_metrics)
+
     pd.DataFrame(results).to_csv(_REPO / "results/aiqgen_comparison.csv", index=False)
     print("Wrote results/aiqgen_comparison.csv")
+
+    # Write hybrid_comparison.csv: binary BKT vs Qwen-hybrid BKT side by side
+    pd.DataFrame([bkt_metrics, hybrid_metrics]).to_csv(
+        _REPO / "results/hybrid_comparison.csv", index=False)
+    print("Wrote results/hybrid_comparison.csv")
+
     gs_df = pd.DataFrame([{"zhu_level": kc, **p} for kc, p in bkt_params.items()])
     gs_df.to_csv(_REPO / "results/guess_slip_by_zhu.csv", index=False)
     print(f"Wrote results/guess_slip_by_zhu.csv\n{gs_df.to_string(index=False)}")

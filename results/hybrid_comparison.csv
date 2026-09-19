@@ -1,0 +1,3 @@
+model,auc,accuracy,n_train,n_test,elapsed_s
+BKT,0.5539,0.7826,87,23,13.9
+BKT+Qwen,0.9097,0.9565,87,23,42.6
