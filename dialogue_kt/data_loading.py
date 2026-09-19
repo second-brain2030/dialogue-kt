@@ -160,6 +160,13 @@ def load_annotated_data(args, fold: Union[int, str, None] = 1):
             train_df[int(.8 * len(train_df)):],
             test_df
         )
+    elif args.dataset == "aiqgen":
+        # 8-sequence sparse dataset; simple 70/15/15 split, no cross-validation
+        df = pd.read_csv(get_annotated_data_filename(args),
+                         converters={col: literal_eval for col in ["dialogue", "meta_data", "annotation"]})
+        df = df.sample(frac=1, random_state=221)
+        n = len(df)
+        return df[:int(.7 * n)], df[int(.7 * n):int(.85 * n)], df[int(.85 * n):]
     raise Exception(f"Loading not supported for {args.dataset}")
 
 def get_model_file_suffix(args, fold = None):

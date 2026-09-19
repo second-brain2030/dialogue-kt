@@ -1,0 +1,5 @@
+model,auc,accuracy,n_train,n_test,elapsed_s
+BKT,0.5539,0.7826,87,23,13.9
+DKT-multi-KC,0.4722,0.7619,6,2,0.2
+DKT-SEM,0.5222,0.7619,6,2,13.0
+BKT+Qwen,0.9097,0.9565,87,23,42.6
